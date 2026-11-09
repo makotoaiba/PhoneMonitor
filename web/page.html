@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>PhoneMonitor</title>
+<style>
+:root{
+  color-scheme: dark;
+  --bg:#1b2430; --panel:#243042; --line:#34425a; --text:#e8ecf2; --muted:#93a1b5;
+  --amber:#f2b544; --green:#6fcf97; --red:#eb5757;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic UI","Meiryo",system-ui,sans-serif;
+  padding:env(safe-area-inset-top) 20px env(safe-area-inset-bottom);
+  display:flex; justify-content:center;
+}
+main{width:100%; max-width:420px; padding:28px 0 32px; display:flex; flex-direction:column; gap:22px}
+header{display:flex; align-items:baseline; justify-content:space-between}
+h1{font-size:15px; font-weight:600; margin:0; letter-spacing:.02em; color:var(--muted)}
+#status{font-size:13px; color:var(--muted)}
+#status.ok{color:var(--green)} #status.bad{color:var(--red)}
+
+.deck{background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:26px 22px 22px;
+  display:flex; flex-direction:column; align-items:center; gap:22px}
+#play{
+  width:132px; height:132px; border-radius:50%; border:none; cursor:pointer;
+  background:var(--amber); color:#2a1d00; font:inherit; font-size:17px; font-weight:700;
+  box-shadow:0 0 0 8px rgba(242,181,68,.14);
+}
+#play[aria-pressed="true"]{background:var(--bg); color:var(--amber); box-shadow:0 0 0 2px var(--amber) inset}
+#play:focus-visible, button:focus-visible, input:focus-visible{outline:3px solid #8ab4ff; outline-offset:3px}
+
+.meters{width:100%; display:grid; grid-template-columns:auto 1fr; gap:8px 10px; align-items:center; font-size:12px; color:var(--muted)}
+.bar{height:10px; background:#1a2230; border-radius:5px; overflow:hidden}
+.bar i{display:block; height:100%; width:0; border-radius:5px;
+  background:linear-gradient(90deg,var(--green) 0 70%,var(--amber) 70% 90%,var(--red) 90%)}
+#lat{font-size:12px; color:var(--muted); min-height:1em}
+
+.row{display:flex; flex-direction:column; gap:10px}
+label{font-size:13px; color:var(--muted)}
+input[type=range]{width:100%; accent-color:var(--amber)}
+.seg{display:grid; grid-template-columns:repeat(3,1fr); border:1px solid var(--line); border-radius:10px; overflow:hidden}
+.seg button{background:transparent; color:var(--text); border:none; padding:10px 0; font:inherit; font-size:14px; cursor:pointer}
+.seg button + button{border-left:1px solid var(--line)}
+.seg button[aria-pressed="true"]{background:var(--line); color:var(--amber); font-weight:600}
+.hint{font-size:12px; color:var(--muted); line-height:1.6; margin:0}
+</style>
+</head>
+<body>
+<main>
+  <header><h1>PhoneMonitor</h1><span id="status" role="status">待機中</span></header>
+
+  <section class="deck">
+    <button id="play" aria-pressed="false">再生する</button>
+    <div class="meters" aria-hidden="true">
+      <span>L</span><div class="bar"><i id="mL"></i></div>
+      <span>R</span><div class="bar"><i id="mR"></i></div>
+    </div>
+    <div id="lat"></div>
+  </section>
+
+  <div class="row">
+    <label for="vol">音量</label>
+    <input id="vol" type="range" min="0" max="100" value="80">
+  </div>
+
+  <div class="row">
+    <label id="bufLabel">バッファ</label>
+    <div class="seg" role="group" aria-labelledby="bufLabel">
+      <button data-b="s">小</button><button data-b="m">中</button><button data-b="l">大</button>
+    </div>
+    <p class="hint">音が途切れるときは大きくしてください。小さいほど遅れが短くなります。</p>
+  </div>
+
+  <p class="hint">iPhoneはマナーモードでも鳴るように設定しています。画面を消すと止まることがあります。</p>
+</main>
+<script>
+(function(){
+  var key = new URLSearchParams(location.search).get('k') || '';
+  var remote = location.protocol === 'https:';
+  var wsUrl = (remote ? 'wss://' : 'ws://') + location.host + '/ws' + (key ? '?k=' + encodeURIComponent(key) : '');
+  var BUF = { s: remote ? 0.25 : 0.12, m: remote ? 0.5 : 0.3, l: remote ? 1.0 : 0.7 };
+  var mode = 'm';
+
+  var playBtn = document.getElementById('play'), statusEl = document.getElementById('status');
+  var mL = document.getElementById('mL'), mR = document.getElementById('mR'), latEl = document.getElementById('lat');
+  var vol = document.getElementById('vol');
+  var segBtns = document.querySelectorAll('.seg button');
+
+  var ctx = null, gain = null, ws = null, sr = 48000, ch = 2, next = 0, playing = false;
+  var retry = null, fails = 0, gotData = false, peakL = 0, peakR = 0, wakeLock = null;
+
+  function setStatus(t, cls){ statusEl.textContent = t; statusEl.className = cls || ''; }
+  function setMode(m){ mode = m; next = 0; segBtns.forEach(function(b){ b.setAttribute('aria-pressed', b.dataset.b === m ? 'true' : 'false'); }); }
+  segBtns.forEach(function(b){ b.addEventListener('click', function(){ setMode(b.dataset.b); }); });
+  setMode('m');
+
+  vol.addEventListener('input', function(){ if (gain) gain.gain.value = Math.pow(vol.value / 100, 2); });
+
+  function makeContext(){
+    try { ctx = new AudioContext({ sampleRate: sr, latencyHint: 'playback' }); }
+    catch (e) { ctx = new AudioContext(); }
+    gain = ctx.createGain();
+    gain.gain.value = Math.pow(vol.value / 100, 2);
+    gain.connect(ctx.destination);
+    next = 0;
+  }
+
+  function connect(){
+    clearTimeout(retry);
+    setStatus('接続中…');
+    gotData = false;
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function(){ fails = 0; setStatus('受信中', 'ok'); };
+    ws.onmessage = function(ev){
+      if (typeof ev.data === 'string') {
+        try { var h = JSON.parse(ev.data); if (h.sr) sr = h.sr; if (h.ch) ch = h.ch; } catch (e) {}
+        return;
+      }
+      gotData = true;
+      onAudio(ev.data);
+    };
+    ws.onclose = function(){
+      if (!playing) return;
+      fails++;
+      if (fails >= 3 && !gotData)
+        setStatus(remote ? 'つながりません。公開が止まったか、URLが古い可能性があります' : 'つながりません。PCのプラグインを確認してください', 'bad');
+      else
+        setStatus('切断されました。再接続しています…', 'bad');
+      retry = setTimeout(connect, Math.min(10000, 1500 * fails));
+    };
+  }
+
+  function onAudio(ab){
+    if (!ctx) return;
+    var s = new Int16Array(ab), frames = Math.floor(s.length / ch);
+    if (frames <= 0) return;
+    var buf = ctx.createBuffer(ch, frames, sr);
+    var pl = 0, pr = 0;
+    for (var c = 0; c < ch; c++) {
+      var d = buf.getChannelData(c), p = 0;
+      for (var i = 0; i < frames; i++) { var v = s[i * ch + c] / 32768; d[i] = v; if (v < 0) v = -v; if (v > p) p = v; }
+      if (c === 0) pl = p; else pr = p;
+    }
+    if (ch === 1) pr = pl;
+    peakL = Math.max(pl, peakL); peakR = Math.max(pr, peakR);
+
+    var now = ctx.currentTime, target = BUF[mode], dur = frames / sr;
+    if (next < now + 0.01) next = now + target;                         // 途切れ → 貯め直し
+    else if (next > now + target + Math.max(0.4, target)) return;       // 遅れすぎ → 追いつくため捨てる
+    var src = ctx.createBufferSource();
+    src.buffer = buf; src.connect(gain); src.start(next);
+    next += dur;
+  }
+
+  function drawMeters(){
+    if (!playing) { mL.style.width = mR.style.width = '0'; return; }
+    mL.style.width = Math.min(100, peakL * 100) + '%';
+    mR.style.width = Math.min(100, peakR * 100) + '%';
+    peakL *= 0.82; peakR *= 0.82;
+    if (ctx && next > 0) {
+      var l = Math.max(0, next - ctx.currentTime);
+      latEl.textContent = '遅れ 約' + l.toFixed(1) + '秒（通信分は除く）';
+    }
+    requestAnimationFrame(drawMeters);
+  }
+
+  function start(){
+    playing = true;
+    playBtn.setAttribute('aria-pressed', 'true'); playBtn.textContent = '停止する';
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+    makeContext();
+    ctx.resume();
+    if ('wakeLock' in navigator) navigator.wakeLock.request('screen').then(function(w){ wakeLock = w; }).catch(function(){});
+    connect();
+    requestAnimationFrame(drawMeters);
+  }
+
+  function stop(){
+    playing = false;
+    clearTimeout(retry);
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    if (ctx) { ctx.close(); ctx = null; }
+    if (wakeLock) { wakeLock.release().catch(function(){}); wakeLock = null; }
+    playBtn.setAttribute('aria-pressed', 'false'); playBtn.textContent = '再生する';
+    latEl.textContent = '';
+    setStatus('待機中');
+  }
+
+  playBtn.addEventListener('click', function(){ playing ? stop() : start(); });
+
+  document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState === 'visible' && playing && ctx) {
+      ctx.resume(); next = 0;
+      if ('wakeLock' in navigator && !wakeLock) navigator.wakeLock.request('screen').then(function(w){ wakeLock = w; }).catch(function(){});
+    }
+  });
+})();
+</script>
+</body>
+</html>

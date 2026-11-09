@@ -1,0 +1,12 @@
+# ビルド生成物
+build/
+dist/
+out/
+*.zip
+
+# エディタ・OS
+.vs/
+.vscode/
+*.user
+.DS_Store
+Thumbs.db
